@@ -12,8 +12,8 @@
 #ifndef MONGO_FDW_H
 #define MONGO_FDW_H
 
-#include "bson.h"
-#include "mongo.h"
+//#include "bson.h"
+#include "mongoc.h"
 
 #include "fmgr.h"
 #include "catalog/pg_foreign_server.h"

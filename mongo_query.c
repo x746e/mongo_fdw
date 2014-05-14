@@ -32,7 +32,7 @@ static char * MongoOperatorName(const char *operatorName);
 static List * EqualityOperatorList(List *operatorList);
 static List * UniqueColumnList(List *operatorList);
 static List * ColumnOperatorList(Var *column, List *operatorList);
-static void AppendConstantValue(bson *queryDocument, const char *keyName,
+static void AppendConstantValue(bson_t *queryDocument, const char *keyName,
 								Const *constant);
 
 
@@ -161,11 +161,11 @@ QueryDocument(Oid relationId, List *opExpressionList)
 	List *columnList = NIL;
 	ListCell *equalityOperatorCell = NULL;
 	ListCell *columnCell = NULL;
-	bson *queryDocument = NULL;
+	bson_t *queryDocument = NULL;
 	int documentStatus = BSON_OK;
 
-	queryDocument = bson_alloc();
-	bson_init(queryDocument);
+	queryDocument = bson_new();
+	// TODO: check queryDocument != NULL ?
 
 	/*
 	 * We distinguish between equality expressions and others since we need to
@@ -209,6 +209,7 @@ QueryDocument(Oid relationId, List *opExpressionList)
 		char *columnName = NULL;
 		List *columnOperatorList = NIL;
 		ListCell *columnOperatorCell = NULL;
+		bson_t *child = NULL;
 
 		columnId = column->varattno;
 		columnName = get_relid_attribute_name(relationId, columnId);
@@ -217,7 +218,8 @@ QueryDocument(Oid relationId, List *opExpressionList)
 		columnOperatorList = ColumnOperatorList(column, comparisonOperatorList);
 
 		/* for comparison expressions, start a sub-document */
-		bson_append_start_object(queryDocument, columnName);
+		bson_append_document_begin(queryDocument, columnName, strlen(columnName),
+				&child);
 
 		foreach(columnOperatorCell, columnOperatorList)
 		{
@@ -231,18 +233,20 @@ QueryDocument(Oid relationId, List *opExpressionList)
 			operatorName = get_opname(columnOperator->opno);
 			mongoOperatorName = MongoOperatorName(operatorName);
 
-			AppendConstantValue(queryDocument, mongoOperatorName, constant);
+			AppendConstantValue(child, mongoOperatorName, constant);
 		}
 
-		bson_append_finish_object(queryDocument);
+		bson_append_document_end(queryDocument, child);
+		bson_destroy(child);
 	}
 
-	documentStatus = bson_finish(queryDocument);
+	// XXX: em, what kind of errors can we get there?
+	/*documentStatus = bson_finish(queryDocument);
 	if (documentStatus != BSON_OK)
 	{
 		ereport(ERROR, (errmsg("could not create document for query"),
 						errhint("BSON error: %d", queryDocument->err)));
-	}
+	}*/
 
 	return queryDocument;
 }
@@ -361,7 +365,7 @@ ColumnOperatorList(Var *column, List *operatorList)
  * its MongoDB equivalent.
  */
 static void
-AppendConstantValue(bson *queryDocument, const char *keyName, Const *constant)
+AppendConstantValue(bson_t *queryDocument, const char *keyName, Const *constant)
 {
 	Datum constantValue = constant->constvalue;
 	Oid constantTypeId = constant->consttype;
@@ -369,7 +373,7 @@ AppendConstantValue(bson *queryDocument, const char *keyName, Const *constant)
 	bool constantNull = constant->constisnull;
 	if (constantNull)
 	{
-		bson_append_null(queryDocument, keyName);
+		bson_append_null(queryDocument, keyName, strlen(keyName));
 		return;
 	}
 
@@ -378,44 +382,45 @@ AppendConstantValue(bson *queryDocument, const char *keyName, Const *constant)
 		case INT2OID:
 		{
 			int16 value = DatumGetInt16(constantValue);
-			bson_append_int(queryDocument, keyName, (int) value);
+			bson_append_int32(queryDocument, keyName, strlen(keyName), (int) value);
 			break;
 		}
 		case INT4OID:
 		{
 			int32 value = DatumGetInt32(constantValue);
-			bson_append_int(queryDocument, keyName, value);
+			bson_append_int32(queryDocument, keyName, strlen(keyName), value);
 			break;
 		}
 		case INT8OID:
 		{
 			int64 value = DatumGetInt64(constantValue);
-			bson_append_long(queryDocument, keyName, value);
+			bson_append_int64(queryDocument, keyName, strlen(keyName), value);
 			break;
 		}
 		case FLOAT4OID:
 		{
 			float4 value = DatumGetFloat4(constantValue);
-			bson_append_double(queryDocument, keyName, (double) value);
+			bson_append_double(queryDocument, keyName, strlen(keyName),
+					(double) value);
 			break;
 		}
 		case FLOAT8OID:
 		{
 			float8 value = DatumGetFloat8(constantValue);
-			bson_append_double(queryDocument, keyName, value);
+			bson_append_double(queryDocument, keyName, strlen(keyName), value);
 			break;
 		}
 		case NUMERICOID:
 		{
 			Datum valueDatum = DirectFunctionCall1(numeric_float8, constantValue);
 			float8 value = DatumGetFloat8(valueDatum);
-			bson_append_double(queryDocument, keyName, value);
+			bson_append_double(queryDocument, keyName, strlen(keyName), value);
 			break;
 		}
 		case BOOLOID:
 		{
 			bool value = DatumGetBool(constantValue);
-			bson_append_int(queryDocument, keyName, (int) value);
+			bson_append_bool(queryDocument, keyName, strlen(keyName), (int) value);
 			break;
 		}
 		case BPCHAROID:
@@ -429,7 +434,9 @@ AppendConstantValue(bson *queryDocument, const char *keyName, Const *constant)
 			getTypeOutputInfo(constantTypeId, &outputFunctionId, &typeVarLength);
 			outputString = OidOutputFunctionCall(outputFunctionId, constantValue);
 
-			bson_append_string(queryDocument, keyName, outputString);
+			// XXX: I'm not sure it's UTF8 here..
+			bson_append_utf8(queryDocument, keyName, strlen(keyName),
+					outputString, -1 /* length */);
 			break;
 		}
 	    case NAMEOID:
@@ -444,7 +451,7 @@ AppendConstantValue(bson *queryDocument, const char *keyName, Const *constant)
 			outputString = OidOutputFunctionCall(outputFunctionId, constantValue);
 			bson_oid_from_string(&bsonObjectId, outputString);
 
-			bson_append_oid(queryDocument, keyName, &bsonObjectId);
+			bson_append_oid(queryDocument, keyName, strlen(keyName), &bsonObjectId);
 			break;
 		}
 		case DATEOID:
@@ -454,7 +461,8 @@ AppendConstantValue(bson *queryDocument, const char *keyName, Const *constant)
 			int64 valueMicroSecs = valueTimestamp + POSTGRES_TO_UNIX_EPOCH_USECS;
 			int64 valueMilliSecs = valueMicroSecs / 1000;
 
-			bson_append_date(queryDocument, keyName, valueMilliSecs);
+			bson_append_date_time(queryDocument, keyName, strlen(keyName),
+					valueMilliSecs);
 			break;
 		}
 		case TIMESTAMPOID:
@@ -464,7 +472,8 @@ AppendConstantValue(bson *queryDocument, const char *keyName, Const *constant)
 			int64 valueMicroSecs = valueTimestamp + POSTGRES_TO_UNIX_EPOCH_USECS;
 			int64 valueMilliSecs = valueMicroSecs / 1000;
 
-			bson_append_date(queryDocument, keyName, valueMilliSecs);
+			bson_append_date_time(queryDocument, keyName, strlen(keyName),
+					valueMilliSecs);
 			break;
 		}
 		default:

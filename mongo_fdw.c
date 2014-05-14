@@ -102,6 +102,10 @@ mongo_fdw_handler(PG_FUNCTION_ARGS)
 	fdwRoutine->EndForeignScan = MongoEndForeignScan;
 	fdwRoutine->AnalyzeForeignTable = MongoAnalyzeForeignTable;
 
+	// XXX: Is it OK to run it here?
+	mongoc_init();
+	// TODO: run mongoc_cleanup() somewhere
+
 	PG_RETURN_POINTER(fdwRoutine);
 }
 
@@ -316,7 +320,7 @@ MongoGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,	Oid foreignTableId,
 	ForeignScan *foreignScan = NULL;
 	List *foreignPrivateList = NIL;
 	List *opExpressionList = NIL;
-	bson *queryDocument = NULL;
+	bson_t *queryDocument = NULL;
 	Const *queryBuffer = NULL;
 	List *columnList = NIL;
 
@@ -586,7 +590,7 @@ MongoReScanForeignScan(ForeignScanState *scanState)
  * and the caller should therefore not free it.
  */
 static Const *
-SerializeDocument(bson *document)
+SerializeDocument(bson_t *document)
 {
 	Const *serializedDocument = NULL;
 	Datum documentDatum = 0;
@@ -596,8 +600,8 @@ SerializeDocument(bson *document)
 	 * we have an empty document, the document size can't be zero according to
 	 * bson apis.
 	 */
-	const char *documentData = bson_data(document);
-	int32 documentSize = bson_buffer_size(document);
+	const char *documentData = bson_get_data(document);
+	int32 documentSize = document->len;
 	Assert(documentSize != 0);
 
 	documentDatum = CStringGetDatum(documentData);
@@ -615,7 +619,7 @@ SerializeDocument(bson *document)
 static bson *
 DeserializeDocument(Const *constant)
 {
-	bson *document = NULL;
+	bson_t *document = NULL;
 	Datum documentDatum = constant->constvalue;
 	char *documentData = DatumGetCString(documentDatum);
 
@@ -639,30 +643,43 @@ static double
 ForeignTableDocumentCount(Oid foreignTableId)
 {
 	MongoFdwOptions *options = NULL;
-	mongo *mongoConnection = NULL;
-	const bson *emptyQuery = NULL;
-	int32 status = MONGO_ERROR;
+	mongo_client_t *client;
+	mongo_collection_t *collection;
+	bson_error_t error;
+	const bson_t *doc;
+	const char uristr[1024];
+	bson_t query
+	bson_error_t error;
 	double documentCount = 0.0;
+	int64_t count;
 
-	/* resolve foreign table options; and connect to mongo server */
 	options = MongoGetOptions(foreignTableId);
-
-	mongoConnection = mongo_alloc();
-	mongo_init(mongoConnection);
-
-	status = mongo_connect(mongoConnection, options->addressName, options->portNumber);
-	if (status == MONGO_OK)
-	{
-		documentCount = mongo_count(mongoConnection, options->databaseName,
-									options->collectionName, emptyQuery);
+	/* resolve foreign table options; and connect to mongo server */
+	sprintf(uristr, "mongodb://%s:%s/", options->addressName, options->portNumber)
+	client = mongoc_client_new(uristr);
+	if (!client) {
+		ereport(ERROR, (errmsg("could not create mongoc client"),
+						errhint("Probably server uri isn't correct: %s", uri_str)));
+		return -1.0;
 	}
-	else
-	{
+
+	bson_init(&query);
+
+	collection = mongoc_client_get_connection(client, options->databaseName,
+			options->collectionName);
+
+	count = mongoc_collection_count(
+				collection, MONGOC_QUERY_NONE, &query, 0, 0, NULL, &error);
+
+	if (count == -1) {
 		documentCount = -1.0;
+		ereport(ERROR, (errmsg("could not get collection.count()"),
+						errhint("Mongo error: %s", error.message)));
 	}
 
-	mongo_destroy(mongoConnection);
-	mongo_dealloc(mongoConnection);
+	bson_destroy(&query);
+	mongoc_collection_destroy(collection);
+	mongoc_client_destroy(client);
 
 	return documentCount;
 }
@@ -1283,8 +1300,10 @@ MongoAcquireSampleRows(Relation relation, int errorLevel,
 	AttrNumber columnCount = 0;
 	AttrNumber columnId = 0;
 	HTAB *columnMappingHash = NULL;
+	// TODO:
 	mongo_cursor *mongoCursor = NULL;
 	bson *queryDocument = NULL;
+
 	Const *queryBuffer = NULL;
 	List *columnList = NIL;
 	ForeignScanState *scanState = NULL;
