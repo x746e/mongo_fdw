@@ -12,8 +12,7 @@
 #ifndef MONGO_FDW_H
 #define MONGO_FDW_H
 
-//#include "bson.h"
-#include "mongoc.h"
+#include <mongoc.h>
 
 #include "fmgr.h"
 #include "catalog/pg_foreign_server.h"
@@ -93,9 +92,9 @@ typedef struct MongoFdwOptions
 typedef struct MongoFdwExecState
 {
 	struct HTAB *columnMappingHash;
-	mongo *mongoConnection;
-	mongo_cursor *mongoCursor;
-	bson *queryDocument;
+	mongoc_client_t *mongoClient;
+	mongoc_cursor_t *mongoCursor;
+	bson_t *queryDocument;
 
 } MongoFdwExecState;
 
@@ -119,7 +118,7 @@ typedef struct ColumnMapping
 
 /* Function declarations related to creating the mongo query */
 extern List * ApplicableOpExpressionList(RelOptInfo *baserel);
-extern bson * QueryDocument(Oid relationId, List *opExpressionList);
+extern bson_t * QueryDocument(Oid relationId, List *opExpressionList);
 extern List * ColumnList(RelOptInfo *baserel);
 
 /* Function declarations for foreign data wrapper */

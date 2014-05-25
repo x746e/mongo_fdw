@@ -4,26 +4,11 @@
 #
 
 MODULE_big = mongo_fdw
-
-#
-# We assume we are running on a POSIX compliant system (Linux, OSX). If you are
-# on another platform, change env_posix.os in MONGO_OBJS with the appropriate
-# environment object file.
-#
-
-MONGO_DRIVER = mongo-c-driver
-MONGO_PATH = $(MONGO_DRIVER)/src
-MONGO_OBJS = $(MONGO_PATH)/bson.os $(MONGO_PATH)/encoding.os $(MONGO_PATH)/md5.os \
-             $(MONGO_PATH)/mongo.os $(MONGO_PATH)/numbers.os $(MONGO_PATH)/env.os
-
-PG_CPPFLAGS = --std=c99 -I$(MONGO_PATH)
-OBJS = mongo_fdw.o mongo_query.o $(MONGO_OBJS)
+PG_CPPFLAGS = --std=c99 $(shell pkg-config --cflags libmongoc-1.0)
+OBJS = mongo_fdw.o mongo_query.o
 
 EXTENSION = mongo_fdw
 DATA = mongo_fdw--1.0.sql
-
-$(MONGO_DRIVER)/%.os:
-	$(MAKE) -C $(MONGO_DRIVER) $*.os
 
 #
 # Users need to specify their Postgres installation path through pg_config. For

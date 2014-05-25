@@ -153,7 +153,7 @@ FindArgumentOfType(List *argumentList, NodeTag argumentType)
  * "l_shipdate >= date '1994-01-01' AND l_shipdate < date '1995-01-01'" become
  * "l_shipdate: { $gte: new Date(757382400000), $lt: new Date(788918400000) }".
  */
-bson *
+bson_t *
 QueryDocument(Oid relationId, List *opExpressionList)
 {
 	List *equalityOperatorList = NIL;
@@ -162,7 +162,7 @@ QueryDocument(Oid relationId, List *opExpressionList)
 	ListCell *equalityOperatorCell = NULL;
 	ListCell *columnCell = NULL;
 	bson_t *queryDocument = NULL;
-	int documentStatus = BSON_OK;
+	//int documentStatus = BSON_OK;
 
 	queryDocument = bson_new();
 	// TODO: check queryDocument != NULL ?
@@ -219,7 +219,7 @@ QueryDocument(Oid relationId, List *opExpressionList)
 
 		/* for comparison expressions, start a sub-document */
 		bson_append_document_begin(queryDocument, columnName, strlen(columnName),
-				&child);
+				child);
 
 		foreach(columnOperatorCell, columnOperatorList)
 		{
@@ -449,7 +449,7 @@ AppendConstantValue(bson_t *queryDocument, const char *keyName, Const *constant)
 
 			getTypeOutputInfo(constantTypeId, &outputFunctionId, &typeVarLength);
 			outputString = OidOutputFunctionCall(outputFunctionId, constantValue);
-			bson_oid_from_string(&bsonObjectId, outputString);
+			bson_oid_init_from_string(&bsonObjectId, outputString);
 
 			bson_append_oid(queryDocument, keyName, strlen(keyName), &bsonObjectId);
 			break;

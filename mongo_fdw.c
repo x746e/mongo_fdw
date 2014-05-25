@@ -54,18 +54,18 @@ static void MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags
 static TupleTableSlot * MongoIterateForeignScan(ForeignScanState *scanState);
 static void MongoEndForeignScan(ForeignScanState *scanState);
 static void MongoReScanForeignScan(ForeignScanState *scanState);
-static Const * SerializeDocument(bson *document);
-static bson * DeserializeDocument(Const *constant);
+static Const * SerializeDocument(bson_t *document);
+static bson_t * DeserializeDocument(Const *constant);
 static double ForeignTableDocumentCount(Oid foreignTableId);
 static MongoFdwOptions * MongoGetOptions(Oid foreignTableId);
 static char * MongoGetOptionValue(Oid foreignTableId, const char *optionName);
 static HTAB * ColumnMappingHash(Oid foreignTableId, List *columnList);
-static void FillTupleSlot(const bson *bsonDocument, const char *bsonDocumentKey,
+static void FillTupleSlot(const bson_t *bsonDocument, const char *bsonDocumentKey,
 						  HTAB *columnMappingHash, Datum *columnValues,
 						  bool *columnNulls);
-static bool ColumnTypesCompatible(bson_type bsonType, Oid columnTypeId);
-static Datum ColumnValueArray(bson_iterator *bsonIterator, Oid valueTypeId);
-static Datum ColumnValue(bson_iterator *bsonIterator, Oid columnTypeId,
+static bool ColumnTypesCompatible(bson_type_t bsonType, Oid columnTypeId);
+static Datum ColumnValueArray(bson_iter_t *bsonIterator, Oid valueTypeId);
+static Datum ColumnValue(bson_iter_t *bsonIterator, Oid columnTypeId,
 						 int32 columnTypeMod);
 static void MongoFreeScanState(MongoFdwExecState *executionState);
 static bool MongoAnalyzeForeignTable(Relation relation,
@@ -344,7 +344,7 @@ MongoGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,	Oid foreignTableId,
 	queryBuffer = SerializeDocument(queryDocument);
 
 	/* only clean up the query struct, but not its data */
-	bson_dealloc(queryDocument);
+	bson_destroy(queryDocument);
 
 	/* we don't need to serialize column list as lists are copiable */
 	columnList = ColumnList(baserel);
@@ -392,20 +392,17 @@ MongoExplainForeignScan(ForeignScanState *scanState, ExplainState *explainState)
 static void
 MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 {
-	mongo *mongoConnection = NULL;
-	mongo_cursor *mongoCursor = NULL;
-	int32 connectStatus = MONGO_ERROR;
+	mongoc_client_t *mongoClient = NULL;
+	mongoc_cursor_t *mongoCursor = NULL;
+	mongoc_collection_t *mongoCollection = NULL;
 	Oid foreignTableId = InvalidOid;
 	List *columnList = NIL;
 	HTAB *columnMappingHash = NULL;
-	char *addressName = NULL;
-	int32 portNumber = 0;
-	int32 errorCode = 0;
-	StringInfo namespaceName = NULL;
 	ForeignScan *foreignScan = NULL;
 	List *foreignPrivateList = NIL;
 	Const *queryBuffer = NULL;
-	bson *queryDocument = NULL;
+	bson_t *queryDocument = NULL;
+	char uristr[1024];
 	MongoFdwOptions *mongoFdwOptions = NULL;
 	MongoFdwExecState *executionState = NULL;
 
@@ -419,22 +416,15 @@ MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 	mongoFdwOptions = MongoGetOptions(foreignTableId);
 
 	/* resolve hostname and port number; and connect to mongo server */
-	addressName = mongoFdwOptions->addressName;
-	portNumber = mongoFdwOptions->portNumber;
+	snprintf(uristr, 1024, "mongodb://%s:%d/", mongoFdwOptions->addressName,
+			 mongoFdwOptions->portNumber); // XXX: remove duplicates
 
-	mongoConnection = mongo_alloc();
-	mongo_init(mongoConnection);
-
-	connectStatus = mongo_connect(mongoConnection, addressName, portNumber);
-	if (connectStatus != MONGO_OK)
-	{
-		errorCode = (int32) mongoConnection->err;
-
-		mongo_destroy(mongoConnection);
-		mongo_dealloc(mongoConnection);
-
-		ereport(ERROR, (errmsg("could not connect to %s:%d", addressName, portNumber),
-						errhint("Mongo driver connection error: %d", errorCode)));
+	mongoClient = mongoc_client_new(uristr);
+	if (!mongoClient) {
+		ereport(ERROR, (errmsg("could not create mongoc client"),
+						errhint("Probably server uri isn't correct: %s", uristr)));
+		// XXX: free resources
+		return;
 	}
 
 	/* deserialize query document; and create column info hash */
@@ -448,19 +438,23 @@ MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 	columnList = (List *) lsecond(foreignPrivateList);
 	columnMappingHash = ColumnMappingHash(foreignTableId, columnList);
 
-	namespaceName = makeStringInfo();
-	appendStringInfo(namespaceName, "%s.%s", mongoFdwOptions->databaseName,
-					 mongoFdwOptions->collectionName);
-
-	/* create cursor for collection name and set query */
-	mongoCursor = mongo_cursor_alloc();
-	mongo_cursor_init(mongoCursor, mongoConnection, namespaceName->data);
-	mongo_cursor_set_query(mongoCursor, queryDocument);
+	/* get collection; get cursor from query */
+	mongoCollection = mongoc_client_get_collection(
+			mongoClient, mongoFdwOptions->databaseName,
+			mongoFdwOptions->collectionName);
+	mongoCursor = mongoc_collection_find(mongoCollection,
+										 MONGOC_QUERY_NONE,	/* flags */
+										 0,					/* skip */
+										 0,					/* limit */
+										 0,					/* batch_size */
+										 queryDocument,		/* query */
+										 NULL,				/* fields */
+										 NULL);				/* read_prefs */
 
 	/* create and set foreign execution state */
 	executionState = (MongoFdwExecState *) palloc0(sizeof(MongoFdwExecState));
 	executionState->columnMappingHash = columnMappingHash;
-	executionState->mongoConnection = mongoConnection;
+	executionState->mongoClient = mongoClient;
 	executionState->mongoCursor = mongoCursor;
 	executionState->queryDocument = queryDocument;
 
@@ -478,9 +472,11 @@ MongoIterateForeignScan(ForeignScanState *scanState)
 {
 	MongoFdwExecState *executionState = (MongoFdwExecState *) scanState->fdw_state;
 	TupleTableSlot *tupleSlot = scanState->ss.ss_ScanTupleSlot;
-	mongo_cursor *mongoCursor = executionState->mongoCursor;
+	mongoc_cursor_t *mongoCursor = executionState->mongoCursor;
 	HTAB *columnMappingHash = executionState->columnMappingHash;
-	int32 cursorStatus = MONGO_ERROR;
+	//int32 cursorStatus = MONGO_ERROR;
+	const bson_t *bsonDocument;
+	bson_error_t error;
 
 	TupleDesc tupleDescriptor = tupleSlot->tts_tupleDescriptor;
 	Datum *columnValues = tupleSlot->tts_values;
@@ -499,10 +495,8 @@ MongoIterateForeignScan(ForeignScanState *scanState)
 	memset(columnValues, 0, columnCount * sizeof(Datum));
 	memset(columnNulls, true, columnCount * sizeof(bool));
 
-	cursorStatus = mongo_cursor_next(mongoCursor);
-	if (cursorStatus == MONGO_OK)
+	if (mongoc_cursor_next(mongoCursor, &bsonDocument))
 	{
-		const bson *bsonDocument = mongo_cursor_bson(mongoCursor);
 		const char *bsonDocumentKey = NULL; /* top level document */
 
 		FillTupleSlot(bsonDocument, bsonDocumentKey,
@@ -510,21 +504,14 @@ MongoIterateForeignScan(ForeignScanState *scanState)
 
 		ExecStoreVirtualTuple(tupleSlot);
 	}
-	else
-	{
-		/*
-		 * The following is a courtesy check. In practice when Mongo shuts down,
-		 * mongo_cursor_next() could possibly crash. This function first frees
-		 * cursor->reply, and then references reply in mongo_cursor_destroy().
-		 */
-		mongo_cursor_error_t errorCode = mongoCursor->err;
-		if (errorCode != MONGO_CURSOR_EXHAUSTED)
-		{
-			MongoFreeScanState(executionState);
 
-			ereport(ERROR, (errmsg("could not iterate over mongo collection"),
-							errhint("Mongo driver cursor error code: %d", errorCode)));
-		}
+	if (mongoc_cursor_error(mongoCursor, &error))
+	{
+		MongoFreeScanState(executionState);
+
+		ereport(ERROR, (errmsg("could not iterate over mongo collection"),
+						errhint("Mongo driver cursor error: %s",
+							error.message)));
 	}
 
 	return tupleSlot;
@@ -557,37 +544,21 @@ static void
 MongoReScanForeignScan(ForeignScanState *scanState)
 {
 	MongoFdwExecState *executionState = (MongoFdwExecState *) scanState->fdw_state;
-	mongo *mongoConnection = executionState->mongoConnection;
-	MongoFdwOptions *mongoFdwOptions = NULL;
-	mongo_cursor *mongoCursor = NULL;
-	StringInfo namespaceName = NULL;
-	Oid foreignTableId = InvalidOid;
+	mongoc_cursor_t *newMongoCursor = NULL;
 
+	/* make a copy of the old cursor */
+	newMongoCursor = mongoc_cursor_clone(executionState->mongoCursor);
 	/* close down the old cursor */
-	mongo_cursor_destroy(executionState->mongoCursor);
-	mongo_cursor_dealloc(executionState->mongoCursor);
-
-	/* reconstruct full collection name */
-	foreignTableId = RelationGetRelid(scanState->ss.ss_currentRelation);
-	mongoFdwOptions = MongoGetOptions(foreignTableId);
-
-	namespaceName = makeStringInfo();
-	appendStringInfo(namespaceName, "%s.%s", mongoFdwOptions->databaseName,
-					 mongoFdwOptions->collectionName);
-
-	/* reconstruct cursor for collection name and set query */
-	mongoCursor = mongo_cursor_alloc();
-	mongo_cursor_init(mongoCursor, mongoConnection, namespaceName->data);
-	mongo_cursor_set_query(mongoCursor, executionState->queryDocument);
-
-	executionState->mongoCursor = mongoCursor;
+	mongoc_cursor_destroy(executionState->mongoCursor);
+	/* set the new cursor in the executionState */
+	executionState->mongoCursor = newMongoCursor;
 }
 
 
 /*
  * SerializeDocument serializes the document's data to a constant, as advised in
  * foreign/fdwapi.h. Note that this function shallow-copies the document's data;
- * and the caller should therefore not free it.
+ * and the caller should therefore not free it. XXX: Is it still true?
  */
 static Const *
 SerializeDocument(bson_t *document)
@@ -600,7 +571,7 @@ SerializeDocument(bson_t *document)
 	 * we have an empty document, the document size can't be zero according to
 	 * bson apis.
 	 */
-	const char *documentData = bson_get_data(document);
+	const uint8_t *documentData = bson_get_data(document);
 	int32 documentSize = document->len;
 	Assert(documentSize != 0);
 
@@ -616,20 +587,17 @@ SerializeDocument(bson_t *document)
  * DeserializeDocument deserializes the constant to a bson document. For this,
  * the function creates a document, and explicitly sets the document's data.
  */
-static bson *
+static bson_t *
 DeserializeDocument(Const *constant)
 {
 	bson_t *document = NULL;
 	Datum documentDatum = constant->constvalue;
-	char *documentData = DatumGetCString(documentDatum);
+	const uint8_t *documentData = (const uint8_t *)DatumGetCString(documentDatum);
 
 	Assert(constant->constlen > 0);
 	Assert(constant->constisnull == false);
 
-	document = bson_alloc();
-	bson_init_size(document, 0);
-	bson_init_finished_data_with_copy(document, documentData);
-
+	document = bson_new_from_data(documentData, constant->constlen);
 	return document;
 }
 
@@ -643,29 +611,30 @@ static double
 ForeignTableDocumentCount(Oid foreignTableId)
 {
 	MongoFdwOptions *options = NULL;
-	mongo_client_t *client;
-	mongo_collection_t *collection;
+	mongoc_client_t *client;
+	mongoc_collection_t *collection;
 	bson_error_t error;
-	const bson_t *doc;
-	const char uristr[1024];
-	bson_t query
-	bson_error_t error;
+	//const bson_t *doc;
+	char uristr[1024];
+	bson_t query;
 	double documentCount = 0.0;
 	int64_t count;
 
 	options = MongoGetOptions(foreignTableId);
 	/* resolve foreign table options; and connect to mongo server */
-	sprintf(uristr, "mongodb://%s:%s/", options->addressName, options->portNumber)
+	snprintf(uristr, 1024, "mongodb://%s:%d/", options->addressName,
+			 options->portNumber); // XXX: remove duplicates
 	client = mongoc_client_new(uristr);
 	if (!client) {
 		ereport(ERROR, (errmsg("could not create mongoc client"),
-						errhint("Probably server uri isn't correct: %s", uri_str)));
+						errhint("Probably server uri isn't correct: %s", uristr)));
+		// XXX: free resources
 		return -1.0;
 	}
 
 	bson_init(&query);
 
-	collection = mongoc_client_get_connection(client, options->databaseName,
+	collection = mongoc_client_get_collection(client, options->databaseName,
 			options->collectionName);
 
 	count = mongoc_collection_count(
@@ -834,16 +803,18 @@ ColumnMappingHash(Oid foreignTableId, List *columnList)
  * passed as NULL.
  */
 static void
-FillTupleSlot(const bson *bsonDocument, const char *bsonDocumentKey,
+FillTupleSlot(const bson_t *bsonDocument, const char *bsonDocumentKey,
 			  HTAB *columnMappingHash, Datum *columnValues, bool *columnNulls)
 {
-	bson_iterator bsonIterator = { NULL, 0 };
-	bson_iterator_init(&bsonIterator, bsonDocument);
+	bson_iter_t bsonIterator;
+	if (!bson_iter_init(&bsonIterator, bsonDocument)) {
+		// TODO: handle error
+	}
 
-	while (bson_iterator_next(&bsonIterator))
+	while (bson_iter_next(&bsonIterator))
 	{
-		const char *bsonKey = bson_iterator_key(&bsonIterator);
-		bson_type bsonType = bson_iterator_type(&bsonIterator);
+		const char *bsonKey = bson_iter_key(&bsonIterator);
+		bson_type_t bsonType = bson_iter_type(&bsonIterator);
 
 		ColumnMapping *columnMapping = NULL;
 		Oid columnTypeId = InvalidOid;
@@ -869,11 +840,18 @@ FillTupleSlot(const bson *bsonDocument, const char *bsonDocumentKey,
 		}
 
 		/* recurse into nested objects */
-		if (bsonType == BSON_OBJECT)
+		if (bsonType == BSON_TYPE_DOCUMENT)
 		{
-			bson subObject;
-			bson_iterator_subobject_init(&bsonIterator, &subObject, false);
-			FillTupleSlot(&subObject, bsonFullKey,
+			// XXX: probably it's better to pass into FillTupleSlot an iterator
+			// instead of new object
+			bson_t *subObject;
+			uint32_t documentLen;
+			const uint8_t *document;
+			bson_iter_document(&bsonIterator, &documentLen, &document);
+
+			subObject = bson_new_from_data(document, documentLen);
+
+			FillTupleSlot(subObject, bsonFullKey,
 						  columnMappingHash, columnValues, columnNulls);
 			continue;
 		}
@@ -884,7 +862,7 @@ FillTupleSlot(const bson *bsonDocument, const char *bsonDocumentKey,
 													  HASH_FIND, &handleFound);
 
 		/* if no corresponding column or null bson value, continue */
-		if (columnMapping == NULL || bsonType == BSON_NULL)
+		if (columnMapping == NULL || bsonType == BSON_TYPE_NULL)
 		{
 			continue;
 		}
@@ -893,7 +871,7 @@ FillTupleSlot(const bson *bsonDocument, const char *bsonDocumentKey,
 		columnTypeId = columnMapping->columnTypeId;
 		columnArrayTypeId = columnMapping->columnArrayTypeId;
 
-		if (OidIsValid(columnArrayTypeId) && bsonType == BSON_ARRAY)
+		if (OidIsValid(columnArrayTypeId) && bsonType == BSON_TYPE_ARRAY)
 		{
 			compatibleTypes = true;
 		}
@@ -936,7 +914,7 @@ FillTupleSlot(const bson *bsonDocument, const char *bsonDocumentKey,
  * internal conversions applied by BSON APIs.
  */
 static bool
-ColumnTypesCompatible(bson_type bsonType, Oid columnTypeId)
+ColumnTypesCompatible(bson_type_t bsonType, Oid columnTypeId)
 {
 	bool compatibleTypes = false;
 
@@ -947,8 +925,8 @@ ColumnTypesCompatible(bson_type bsonType, Oid columnTypeId)
 		case INT8OID: case FLOAT4OID:
 		case FLOAT8OID: case NUMERICOID:
 		{
-			if (bsonType == BSON_INT || bsonType == BSON_LONG ||
-				bsonType == BSON_DOUBLE)
+			if (bsonType == BSON_TYPE_INT32 || bsonType == BSON_TYPE_INT64 ||
+				bsonType == BSON_TYPE_DOUBLE)
 			{
 				compatibleTypes = true;
 			}
@@ -956,8 +934,8 @@ ColumnTypesCompatible(bson_type bsonType, Oid columnTypeId)
 		}
 		case BOOLOID:
 		{
-			if (bsonType == BSON_INT || bsonType == BSON_LONG ||
-				bsonType == BSON_DOUBLE || bsonType == BSON_BOOL)
+			if (bsonType == BSON_TYPE_INT32 || bsonType == BSON_TYPE_INT64 ||
+				bsonType == BSON_TYPE_DOUBLE || bsonType == BSON_TYPE_BOOL)
 			{
 				compatibleTypes = true;
 			}
@@ -967,7 +945,7 @@ ColumnTypesCompatible(bson_type bsonType, Oid columnTypeId)
 		case VARCHAROID:
 		case TEXTOID:
 		{
-			if (bsonType == BSON_STRING)
+			if (bsonType == BSON_TYPE_UTF8)
 			{
 				compatibleTypes = true;
 			}
@@ -980,7 +958,7 @@ ColumnTypesCompatible(bson_type bsonType, Oid columnTypeId)
 			 * object identifier. We can safely overload this 64-byte data type
 			 * since it's reserved for internal use in PostgreSQL.
 			 */
-			if (bsonType == BSON_OID)
+			if (bsonType == BSON_TYPE_OID)
 			{
 				compatibleTypes = true;
 			}
@@ -990,7 +968,7 @@ ColumnTypesCompatible(bson_type bsonType, Oid columnTypeId)
 		case TIMESTAMPOID:
 		case TIMESTAMPTZOID:
 		{
-			if (bsonType == BSON_DATE)
+			if (bsonType == BSON_TYPE_DATE_TIME)
 			{
 				compatibleTypes = true;
 			}
@@ -1021,7 +999,7 @@ ColumnTypesCompatible(bson_type bsonType, Oid columnTypeId)
  * datum from element datums, and returns the array datum.
  */
 static Datum
-ColumnValueArray(bson_iterator *bsonIterator, Oid valueTypeId)
+ColumnValueArray(bson_iter_t *bsonIterator, Oid valueTypeId)
 {
 	Datum *columnValueArray = palloc0(INITIAL_ARRAY_CAPACITY * sizeof(Datum));
 	uint32 arrayCapacity = INITIAL_ARRAY_CAPACITY;
@@ -1034,16 +1012,16 @@ ColumnValueArray(bson_iterator *bsonIterator, Oid valueTypeId)
 	char typeAlignment = 0;
 	int16 typeLength = 0;
 
-	bson_iterator bsonSubIterator = { NULL, 0 };
-	bson_iterator_subiterator(bsonIterator, &bsonSubIterator);
+	bson_iter_t bsonSubIterator;
+	bson_iter_recurse(bsonIterator, &bsonSubIterator);
 
-	while (bson_iterator_next(&bsonSubIterator))
+	while (bson_iter_next(&bsonSubIterator))
 	{
-		bson_type bsonType = bson_iterator_type(&bsonSubIterator);
+		bson_type_t bsonType = bson_iter_type(&bsonSubIterator);
 		bool compatibleTypes = false;
 
 		compatibleTypes = ColumnTypesCompatible(bsonType, valueTypeId);
-		if (bsonType == BSON_NULL || !compatibleTypes)
+		if (bsonType == BSON_TYPE_NULL || !compatibleTypes)
 		{
 			continue;
 		}
@@ -1074,7 +1052,7 @@ ColumnValueArray(bson_iterator *bsonIterator, Oid valueTypeId)
  * datum. The function then returns this datum.
  */
 static Datum
-ColumnValue(bson_iterator *bsonIterator, Oid columnTypeId, int32 columnTypeMod)
+ColumnValue(bson_iter_t *bsonIterator, Oid columnTypeId, int32 columnTypeMod)
 {
 	Datum columnValue = 0;
 
@@ -1082,37 +1060,37 @@ ColumnValue(bson_iterator *bsonIterator, Oid columnTypeId, int32 columnTypeMod)
 	{
 		case INT2OID:
 		{
-			int16 value = (int16) bson_iterator_int(bsonIterator);
+			int16 value = (int16) bson_iter_int32(bsonIterator);
 			columnValue = Int16GetDatum(value);
 			break;
 		}
 		case INT4OID:
 		{
-			int32 value = bson_iterator_int(bsonIterator);
+			int32 value = bson_iter_int32(bsonIterator);
 			columnValue = Int32GetDatum(value);
 			break;
 		}
 		case INT8OID:
 		{
-			int64 value = bson_iterator_long(bsonIterator);
+			int64 value = bson_iter_int64(bsonIterator);
 			columnValue = Int64GetDatum(value);
 			break;
 		}
 		case FLOAT4OID:
 		{
-			float4 value = (float4) bson_iterator_double(bsonIterator);
+			float4 value = (float4) bson_iter_double(bsonIterator);
 			columnValue = Float4GetDatum(value);
 			break;
 		}
 		case FLOAT8OID:
 		{
-			float8 value = bson_iterator_double(bsonIterator);
+			float8 value = bson_iter_double(bsonIterator);
 			columnValue = Float8GetDatum(value);
 			break;
 		}
 		case NUMERICOID:
 		{
-			float8 value = bson_iterator_double(bsonIterator);
+			float8 value = bson_iter_double(bsonIterator);
 			Datum valueDatum = Float8GetDatum(value);
 
 			/* overlook type modifiers for numeric */
@@ -1121,13 +1099,13 @@ ColumnValue(bson_iterator *bsonIterator, Oid columnTypeId, int32 columnTypeMod)
 		}
 		case BOOLOID:
 		{
-			bool value = bson_iterator_bool(bsonIterator);
+			bool value = bson_iter_bool(bsonIterator);
 			columnValue = BoolGetDatum(value);
 			break;
 		}
 		case BPCHAROID:
 		{
-			const char *value = bson_iterator_string(bsonIterator);
+			const char *value = bson_iter_utf8(bsonIterator, NULL /* &length */);
 			Datum valueDatum = CStringGetDatum(value);
 
 			columnValue = DirectFunctionCall3(bpcharin, valueDatum,
@@ -1137,7 +1115,7 @@ ColumnValue(bson_iterator *bsonIterator, Oid columnTypeId, int32 columnTypeMod)
 		}
 		case VARCHAROID:
 		{
-			const char *value = bson_iterator_string(bsonIterator);
+			const char *value = bson_iter_utf8(bsonIterator, NULL /* &length */);
 			Datum valueDatum = CStringGetDatum(value);
 
 			columnValue = DirectFunctionCall3(varcharin, valueDatum,
@@ -1147,7 +1125,7 @@ ColumnValue(bson_iterator *bsonIterator, Oid columnTypeId, int32 columnTypeMod)
 		}
 		case TEXTOID:
 		{
-			const char *value = bson_iterator_string(bsonIterator);
+			const char *value = bson_iter_utf8(bsonIterator, NULL /* &length */);
 			columnValue = CStringGetTextDatum(value);
 			break;
 		}
@@ -1156,7 +1134,7 @@ ColumnValue(bson_iterator *bsonIterator, Oid columnTypeId, int32 columnTypeMod)
 			char value[NAMEDATALEN];
 			Datum valueDatum = 0;
 
-			bson_oid_t *bsonObjectId = bson_iterator_oid(bsonIterator);
+			const bson_oid_t *bsonObjectId = bson_iter_oid(bsonIterator);
 			bson_oid_to_string(bsonObjectId, value);
 
 			valueDatum = CStringGetDatum(value);
@@ -1167,7 +1145,7 @@ ColumnValue(bson_iterator *bsonIterator, Oid columnTypeId, int32 columnTypeMod)
 		}
 		case DATEOID:
 		{
-			int64 valueMillis = bson_iterator_date(bsonIterator);
+			int64 valueMillis = bson_iter_date_time(bsonIterator);
 			int64 timestamp = (valueMillis * 1000L) - POSTGRES_TO_UNIX_EPOCH_USECS;
 			Datum timestampDatum = TimestampGetDatum(timestamp);
 
@@ -1177,7 +1155,7 @@ ColumnValue(bson_iterator *bsonIterator, Oid columnTypeId, int32 columnTypeMod)
 		case TIMESTAMPOID:
 		case TIMESTAMPTZOID:
 		{
-			int64 valueMillis = bson_iterator_date(bsonIterator);
+			int64 valueMillis = bson_iter_date_time(bsonIterator);
 			int64 timestamp = (valueMillis * 1000L) - POSTGRES_TO_UNIX_EPOCH_USECS;
 
 			/* overlook type modifiers for timestamp */
@@ -1210,14 +1188,12 @@ MongoFreeScanState(MongoFdwExecState *executionState)
 	}
 
 	bson_destroy(executionState->queryDocument);
-	bson_dealloc(executionState->queryDocument);
 
-	mongo_cursor_destroy(executionState->mongoCursor);
-	mongo_cursor_dealloc(executionState->mongoCursor);
+	mongoc_cursor_destroy(executionState->mongoCursor);
 
 	/* also close the connection to mongo server */
-	mongo_destroy(executionState->mongoConnection);
-	mongo_dealloc(executionState->mongoConnection);
+	mongoc_client_destroy(executionState->mongoClient);
+	// XXX: also mongo_collection_destroy?
 }
 
 
@@ -1300,9 +1276,8 @@ MongoAcquireSampleRows(Relation relation, int errorLevel,
 	AttrNumber columnCount = 0;
 	AttrNumber columnId = 0;
 	HTAB *columnMappingHash = NULL;
-	// TODO:
-	mongo_cursor *mongoCursor = NULL;
-	bson *queryDocument = NULL;
+	mongoc_cursor_t *mongoCursor = NULL;
+	bson_t *queryDocument = NULL;
 
 	Const *queryBuffer = NULL;
 	List *columnList = NIL;
@@ -1314,6 +1289,8 @@ MongoAcquireSampleRows(Relation relation, int errorLevel,
 	int executorFlags = 0;
 	MemoryContext oldContext = CurrentMemoryContext;
 	MemoryContext tupleContext = NULL;
+	const bson_t *bsonDocument;
+	bson_error_t error;
 
 	/* create list of columns in the relation */
 	tupleDescriptor = RelationGetDescr(relation);
@@ -1341,7 +1318,7 @@ MongoAcquireSampleRows(Relation relation, int errorLevel,
 	queryBuffer = SerializeDocument(queryDocument);
 
 	/* only clean up the query struct, but not its data */
-	bson_dealloc(queryDocument);
+	//bson_dealloc(queryDocument);  // XXX
 
 	/* construct foreign plan with query document and column list */
 	foreignPrivateList = list_make2(queryBuffer, columnList);
@@ -1375,8 +1352,6 @@ MongoAcquireSampleRows(Relation relation, int errorLevel,
 
 	for (;;)
 	{
-		int32 cursorStatus = MONGO_ERROR;
-
 		/* check for user-requested abort or sleep */
 		vacuum_delay_point();
 
@@ -1384,10 +1359,8 @@ MongoAcquireSampleRows(Relation relation, int errorLevel,
 		memset(columnValues, 0, columnCount * sizeof(Datum));
 		memset(columnNulls, true, columnCount * sizeof(bool));
 
-		cursorStatus = mongo_cursor_next(mongoCursor);
-		if (cursorStatus == MONGO_OK)
+		if (mongoc_cursor_next(mongoCursor, &bsonDocument))
 		{
-			const bson *bsonDocument = mongo_cursor_bson(mongoCursor);
 			const char *bsonDocumentKey = NULL; /* top level document */
 
 			/* fetch next tuple */
@@ -1395,27 +1368,55 @@ MongoAcquireSampleRows(Relation relation, int errorLevel,
 			MemoryContextSwitchTo(tupleContext);
 
 			FillTupleSlot(bsonDocument, bsonDocumentKey,
-						  columnMappingHash, columnValues, columnNulls);
+						columnMappingHash, columnValues, columnNulls);
 
 			MemoryContextSwitchTo(oldContext);
 		}
-		else
-		{
-			/*
-			 * The following is a courtesy check. In practice when Mongo shuts down,
-			 * mongo_cursor_next() could possibly crash.
-			 */
-			mongo_cursor_error_t errorCode = mongoCursor->err;
-			if (errorCode != MONGO_CURSOR_EXHAUSTED)
-			{
-				MongoFreeScanState(executionState);
-				ereport(ERROR, (errmsg("could not iterate over mongo collection"),
-								errhint("Mongo driver cursor error code: %d",
-										errorCode)));
-			}
 
+		if (mongoc_cursor_error(mongoCursor, &error))
+		{
+			MongoFreeScanState(executionState);
+
+			ereport(ERROR, (errmsg("could not iterate over mongo collection"),
+							errhint("Mongo driver cursor error: %s",
+								error.message)));
+			
 			break;
-   		}
+		}
+
+//		cursorStatus = mongo_cursor_next(mongoCursor);
+//		if (cursorStatus == MONGO_OK)
+//		{
+//			const bson *bsonDocument = mongo_cursor_bson(mongoCursor);
+//			const char *bsonDocumentKey = NULL; /* top level document */
+//
+//			/* fetch next tuple */
+//			MemoryContextReset(tupleContext);
+//			MemoryContextSwitchTo(tupleContext);
+//
+//			FillTupleSlot(bsonDocument, bsonDocumentKey,
+//						  columnMappingHash, columnValues, columnNulls);
+//
+//			MemoryContextSwitchTo(oldContext);
+//		}
+//		else
+//		{
+//			/*
+//			 * The following is a courtesy check. In practice when Mongo shuts down,
+//			 * mongo_cursor_next() could possibly crash.
+//			 */
+//			mongo_cursor_error_t errorCode = mongoCursor->err;
+//			if (errorCode != MONGO_CURSOR_EXHAUSTED)
+//			{
+//				MongoFreeScanState(executionState);
+//				ereport(ERROR, (errmsg("could not iterate over mongo collection"),
+//								errhint("Mongo driver cursor error code: %d",
+//										errorCode)));
+//			}
+//
+//			break;
+//   		}
+
 
 		/*
 		 * The first targetRowCount sample rows are simply copied into the
