@@ -344,7 +344,7 @@ MongoGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,	Oid foreignTableId,
 	queryBuffer = SerializeDocument(queryDocument);
 
 	/* only clean up the query struct, but not its data */
-	bson_destroy(queryDocument);
+	//bson_destroy(queryDocument);
 
 	/* we don't need to serialize column list as lists are copiable */
 	columnList = ColumnList(baserel);
@@ -417,13 +417,14 @@ MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 
 	/* resolve hostname and port number; and connect to mongo server */
 	snprintf(uristr, 1024, "mongodb://%s:%d/", mongoFdwOptions->addressName,
-			 mongoFdwOptions->portNumber); // XXX: remove duplicates
+			 mongoFdwOptions->portNumber); // XXX: duplicated code
 
 	mongoClient = mongoc_client_new(uristr);
-	if (!mongoClient) {
+	if (!mongoClient)
+	{
 		ereport(ERROR, (errmsg("could not create mongoc client"),
 						errhint("Probably server uri isn't correct: %s", uristr)));
-		// XXX: free resources
+		// XXX: free resources?
 		return;
 	}
 
@@ -450,6 +451,11 @@ MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 										 queryDocument,		/* query */
 										 NULL,				/* fields */
 										 NULL);				/* read_prefs */
+	if (!mongoCursor)
+	{
+		ereport(ERROR, (errmsg("could not create mongo cursor")));
+		return; // XXX: free resources?
+	}
 
 	/* create and set foreign execution state */
 	executionState = (MongoFdwExecState *) palloc0(sizeof(MongoFdwExecState));
@@ -495,7 +501,8 @@ MongoIterateForeignScan(ForeignScanState *scanState)
 	memset(columnValues, 0, columnCount * sizeof(Datum));
 	memset(columnNulls, true, columnCount * sizeof(bool));
 
-	if (mongoc_cursor_next(mongoCursor, &bsonDocument))
+	if (mongoc_cursor_more(mongoCursor) &&
+		mongoc_cursor_next(mongoCursor, &bsonDocument))
 	{
 		const char *bsonDocumentKey = NULL; /* top level document */
 
