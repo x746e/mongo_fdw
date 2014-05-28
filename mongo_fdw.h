@@ -93,6 +93,7 @@ typedef struct MongoFdwExecState
 {
 	struct HTAB *columnMappingHash;
 	mongoc_client_t *mongoClient;
+	mongoc_collection_t *mongoCollection;
 	mongoc_cursor_t *mongoCursor;
 	bson_t *queryDocument;
 

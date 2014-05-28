@@ -54,7 +54,7 @@ static void MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags
 static TupleTableSlot * MongoIterateForeignScan(ForeignScanState *scanState);
 static void MongoEndForeignScan(ForeignScanState *scanState);
 static void MongoReScanForeignScan(ForeignScanState *scanState);
-static Const * SerializeDocument(bson_t *document);
+static Const * SerializeAndDestroyDocument(bson_t *document);
 static bson_t * DeserializeDocument(Const *constant);
 static double ForeignTableDocumentCount(Oid foreignTableId);
 static MongoFdwOptions * MongoGetOptions(Oid foreignTableId);
@@ -104,7 +104,7 @@ mongo_fdw_handler(PG_FUNCTION_ARGS)
 
 	// XXX: Is it OK to run it here?
 	mongoc_init();
-	// TODO: run mongoc_cleanup() somewhere
+	// TODO: Run mongoc_cleanup() somewhere.
 
 	PG_RETURN_POINTER(fdwRoutine);
 }
@@ -198,6 +198,28 @@ OptionNamesString(Oid currentContextId)
 }
 
 
+static mongoc_client_t *
+GetMongoClient(MongoFdwOptions *options)
+{
+	mongoc_client_t *client;
+	StringInfo uri = makeStringInfo();
+
+	appendStringInfo(uri, "mongodb://%s:%d/", options->addressName,
+					 options->portNumber);
+
+	client = mongoc_client_new(uri->data);
+
+	if (!client) {
+		ereport(ERROR, (errmsg("could not create mongoc client"),
+						errhint("Probably server uri isn't correct: %s",
+							uri->data)));
+		return NULL;
+	}
+
+	return client;
+}
+
+
 /*
  * MongoGetForeignRelSize obtains relation size estimates for mongo foreign table.
  */
@@ -264,7 +286,7 @@ MongoGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreignTableId)
 		documentSelectivity = clauselist_selectivity(root, opExpressionList,
 													 0, JOIN_INNER, NULL);
 		inputRowCount = clamp_row_est(documentCount * documentSelectivity);
-		
+
 		/*
 		 * We estimate disk costs assuming a sequential scan over the data. This is
 		 * an inaccurate assumption as Mongo scatters the data over disk pages, and
@@ -303,7 +325,7 @@ MongoGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreignTableId)
 												   NIL); /* no fdw_private data */
 
     /* add foreign path as the only possible path */
-	add_path(baserel, foreignPath);	
+	add_path(baserel, foreignPath);
 }
 
 
@@ -341,10 +363,7 @@ MongoGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,	Oid foreignTableId,
 	 */
 	opExpressionList = ApplicableOpExpressionList(baserel);
 	queryDocument = QueryDocument(foreignTableId, opExpressionList);
-	queryBuffer = SerializeDocument(queryDocument);
-
-	/* only clean up the query struct, but not its data */
-	//bson_destroy(queryDocument);
+	queryBuffer = SerializeAndDestroyDocument(queryDocument);
 
 	/* we don't need to serialize column list as lists are copiable */
 	columnList = ColumnList(baserel);
@@ -402,7 +421,6 @@ MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 	List *foreignPrivateList = NIL;
 	Const *queryBuffer = NULL;
 	bson_t *queryDocument = NULL;
-	char uristr[1024];
 	MongoFdwOptions *mongoFdwOptions = NULL;
 	MongoFdwExecState *executionState = NULL;
 
@@ -415,16 +433,9 @@ MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 	foreignTableId = RelationGetRelid(scanState->ss.ss_currentRelation);
 	mongoFdwOptions = MongoGetOptions(foreignTableId);
 
-	/* resolve hostname and port number; and connect to mongo server */
-	snprintf(uristr, 1024, "mongodb://%s:%d/", mongoFdwOptions->addressName,
-			 mongoFdwOptions->portNumber); // XXX: duplicated code
-
-	mongoClient = mongoc_client_new(uristr);
+	mongoClient = GetMongoClient(mongoFdwOptions);
 	if (!mongoClient)
 	{
-		ereport(ERROR, (errmsg("could not create mongoc client"),
-						errhint("Probably server uri isn't correct: %s", uristr)));
-		// XXX: free resources?
 		return;
 	}
 
@@ -454,13 +465,17 @@ MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 	if (!mongoCursor)
 	{
 		ereport(ERROR, (errmsg("could not create mongo cursor")));
-		return; // XXX: free resources?
+		mongoc_client_destroy(mongoClient);
+		mongoc_collection_destroy(mongoCollection);
+		bson_destroy(queryDocument);
+		return;
 	}
 
 	/* create and set foreign execution state */
 	executionState = (MongoFdwExecState *) palloc0(sizeof(MongoFdwExecState));
 	executionState->columnMappingHash = columnMappingHash;
 	executionState->mongoClient = mongoClient;
+	executionState->mongoCollection = mongoCollection;
 	executionState->mongoCursor = mongoCursor;
 	executionState->queryDocument = queryDocument;
 
@@ -480,7 +495,6 @@ MongoIterateForeignScan(ForeignScanState *scanState)
 	TupleTableSlot *tupleSlot = scanState->ss.ss_ScanTupleSlot;
 	mongoc_cursor_t *mongoCursor = executionState->mongoCursor;
 	HTAB *columnMappingHash = executionState->columnMappingHash;
-	//int32 cursorStatus = MONGO_ERROR;
 	const bson_t *bsonDocument;
 	bson_error_t error;
 
@@ -564,11 +578,14 @@ MongoReScanForeignScan(ForeignScanState *scanState)
 
 /*
  * SerializeDocument serializes the document's data to a constant, as advised in
- * foreign/fdwapi.h. Note that this function shallow-copies the document's data;
- * and the caller should therefore not free it. XXX: Is it still true?
+ * foreign/fdwapi.h.
+ *
+ * It also takes ownership of the document, and destroys it. The ownership
+ * transfer is needed to be able to avoid destroying and copying underlying
+ * data buffer, if possible.
  */
 static Const *
-SerializeDocument(bson_t *document)
+SerializeAndDestroyDocument(bson_t *document)
 {
 	Const *serializedDocument = NULL;
 	Datum documentDatum = 0;
@@ -578,8 +595,11 @@ SerializeDocument(bson_t *document)
 	 * we have an empty document, the document size can't be zero according to
 	 * bson apis.
 	 */
-	const uint8_t *documentData = bson_get_data(document);
-	int32 documentSize = document->len;
+	const uint8_t *documentData = NULL;
+	uint32_t documentSize = 0;
+
+	documentData = bson_destroy_with_steal(document, true /* steal */,
+										   &documentSize  /* &length */);
 	Assert(documentSize != 0);
 
 	documentDatum = CStringGetDatum(documentData);
@@ -621,21 +641,14 @@ ForeignTableDocumentCount(Oid foreignTableId)
 	mongoc_client_t *client;
 	mongoc_collection_t *collection;
 	bson_error_t error;
-	//const bson_t *doc;
-	char uristr[1024];
 	bson_t query;
 	double documentCount = 0.0;
 	int64_t count;
 
 	options = MongoGetOptions(foreignTableId);
 	/* resolve foreign table options; and connect to mongo server */
-	snprintf(uristr, 1024, "mongodb://%s:%d/", options->addressName,
-			 options->portNumber); // XXX: remove duplicates
-	client = mongoc_client_new(uristr);
+	client = GetMongoClient(options);
 	if (!client) {
-		ereport(ERROR, (errmsg("could not create mongoc client"),
-						errhint("Probably server uri isn't correct: %s", uristr)));
-		// XXX: free resources
 		return -1.0;
 	}
 
@@ -806,7 +819,7 @@ ColumnMappingHash(Oid foreignTableId, List *columnList)
  * pair, the function checks if the key appears in the column mapping hash, and
  * if the value type is compatible with the one specified for the column. If so,
  * the function converts the value and fills the corresponding tuple position.
- * The bsonDocumentKey parameter is used for recursion, and should always be 
+ * The bsonDocumentKey parameter is used for recursion, and should always be
  * passed as NULL.
  */
 static void
@@ -1195,12 +1208,9 @@ MongoFreeScanState(MongoFdwExecState *executionState)
 	}
 
 	bson_destroy(executionState->queryDocument);
-
 	mongoc_cursor_destroy(executionState->mongoCursor);
-
-	/* also close the connection to mongo server */
+	mongoc_collection_destroy(executionState->mongoCollection);
 	mongoc_client_destroy(executionState->mongoClient);
-	// XXX: also mongo_collection_destroy?
 }
 
 
@@ -1322,10 +1332,7 @@ MongoAcquireSampleRows(Relation relation, int errorLevel,
 
 	foreignTableId = RelationGetRelid(relation);
 	queryDocument = QueryDocument(foreignTableId, NIL);
-	queryBuffer = SerializeDocument(queryDocument);
-
-	/* only clean up the query struct, but not its data */
-	//bson_dealloc(queryDocument);  // XXX
+	queryBuffer = SerializeAndDestroyDocument(queryDocument);
 
 	/* construct foreign plan with query document and column list */
 	foreignPrivateList = list_make2(queryBuffer, columnList);
@@ -1355,7 +1362,7 @@ MongoAcquireSampleRows(Relation relation, int errorLevel,
 	randomState = anl_init_selection_state(targetRowCount);
 
 	columnValues = (Datum *) palloc0(columnCount * sizeof(Datum));
-	columnNulls = (bool *) palloc0(columnCount * sizeof(bool));	
+	columnNulls = (bool *) palloc0(columnCount * sizeof(bool));
 
 	for (;;)
 	{
@@ -1387,43 +1394,9 @@ MongoAcquireSampleRows(Relation relation, int errorLevel,
 			ereport(ERROR, (errmsg("could not iterate over mongo collection"),
 							errhint("Mongo driver cursor error: %s",
 								error.message)));
-			
+
 			break;
 		}
-
-//		cursorStatus = mongo_cursor_next(mongoCursor);
-//		if (cursorStatus == MONGO_OK)
-//		{
-//			const bson *bsonDocument = mongo_cursor_bson(mongoCursor);
-//			const char *bsonDocumentKey = NULL; /* top level document */
-//
-//			/* fetch next tuple */
-//			MemoryContextReset(tupleContext);
-//			MemoryContextSwitchTo(tupleContext);
-//
-//			FillTupleSlot(bsonDocument, bsonDocumentKey,
-//						  columnMappingHash, columnValues, columnNulls);
-//
-//			MemoryContextSwitchTo(oldContext);
-//		}
-//		else
-//		{
-//			/*
-//			 * The following is a courtesy check. In practice when Mongo shuts down,
-//			 * mongo_cursor_next() could possibly crash.
-//			 */
-//			mongo_cursor_error_t errorCode = mongoCursor->err;
-//			if (errorCode != MONGO_CURSOR_EXHAUSTED)
-//			{
-//				MongoFreeScanState(executionState);
-//				ereport(ERROR, (errmsg("could not iterate over mongo collection"),
-//								errhint("Mongo driver cursor error code: %d",
-//										errorCode)));
-//			}
-//
-//			break;
-//   		}
-
 
 		/*
 		 * The first targetRowCount sample rows are simply copied into the
@@ -1475,7 +1448,7 @@ MongoAcquireSampleRows(Relation relation, int errorLevel,
 	/* clean up */
 	MemoryContextDelete(tupleContext);
 	MongoFreeScanState(executionState);
-	
+
 	pfree(columnValues);
 	pfree(columnNulls);
 
