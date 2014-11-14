@@ -798,14 +798,12 @@ MongoExecForeignInsert(EState *estate,
 			if (strcmp(slot->tts_tupleDescriptor->attrs[0]->attname.data, "_id") != 0)
 				elog(ERROR, "first column of MongoDB's foreign table must be \"_id\"");
 
-			if (typoid != NAMEOID)
-				elog(ERROR, "type of first column of MongoDB's foreign table must be \"NAME\"");
-
-			if (attnum == 1)
+			if (attnum == 1 && isnull)
 			{
 				/*
 				 * Ignore the value of first column which is row identifier in MongoDb (_id)
-				 * and let MongoDB to insert the unique value for that column.
+				 * and let MongoDB to insert the unique value for that column
+				 * only if it is null
 				 */
 			}
 			else
