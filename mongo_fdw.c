@@ -674,9 +674,10 @@ MongoPlanForeignModify(PlannerInfo *root,
 	}
 	/*
 	 * RETURNING list not supported
-	 */
+	 * #truongsinh: allow RETURNING for now
 	if (plan->returningLists)
 		elog(ERROR, "RETURNING is not supported by this FDW");
+	*/
 
 	heap_close(rel, NoLock);
 
