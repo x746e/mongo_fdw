@@ -592,10 +592,12 @@ AppenMongoValue(BSON *queryDocument, const char *keyName, Datum value, bool isnu
 
 				valueDatum = DirectFunctionCall1(numeric_float8, elem_values[i]);
 				valueFloat = DatumGetFloat8(valueDatum);
+				char *index = malloc(snprintf(0, 0, "%d", i)+1);
+                sprintf(index, "%d", i);
 #ifdef META_DRIVER
-				status = BsonAppendDouble(&t, keyName, valueFloat);
+				status = BsonAppendDouble(&t, index, valueFloat);
 #else
-				status = BsonAppendDouble(queryDocument, keyName, valueFloat);
+				status = BsonAppendDouble(queryDocument, index, valueFloat);
 #endif
 			}
 			BsonAppendFinishArray(queryDocument, &t);
@@ -632,7 +634,9 @@ AppenMongoValue(BSON *queryDocument, const char *keyName, Datum value, bool isnu
 					continue;
 				getTypeOutputInfo(TEXTOID, &outputFunctionId, &typeVarLength);
 				valueString = OidOutputFunctionCall(outputFunctionId, elem_values[i]);
-				status = BsonAppendUTF8(queryDocument, keyName, valueString);
+				char *index = malloc(snprintf(0, 0, "%d", i)+1);
+                sprintf(index, "%d", i);
+				status = BsonAppendUTF8(queryDocument, index, valueString);
 			}
 			BsonAppendFinishArray(queryDocument, &t);
 			pfree(elem_values);
@@ -671,7 +675,9 @@ AppenMongoValue(BSON *queryDocument, const char *keyName, Datum value, bool isnu
 				getTypeOutputInfo(NAMEOID, &outputFunctionId, &typeVarLength);
 				valueString = OidOutputFunctionCall(outputFunctionId, elem_values[i]);
 				BsonOidFromString(&bsonObjectId, valueString);
-				status = BsonAppendOid(queryDocument, keyName, &bsonObjectId);
+				char *index = malloc(snprintf(0, 0, "%d", i)+1);
+                sprintf(index, "%d", i);
+				status = BsonAppendOid(queryDocument, index, &bsonObjectId);
 			}
 			BsonAppendFinishArray(queryDocument, &t);
 			pfree(elem_values);
