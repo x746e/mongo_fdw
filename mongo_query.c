@@ -500,7 +500,7 @@ AppenMongoValue(BSON *queryDocument, const char *keyName, Datum value, bool isnu
 		case BOOLOID:
 		{
 			bool valueBool = DatumGetBool(value);
-			status = BsonAppendBool(queryDocument, keyName, (int) valueBool);
+			status = BsonAppendBool(queryDocument, keyName, valueBool);
 			break;
 		}
 		case BPCHAROID:

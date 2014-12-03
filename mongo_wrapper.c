@@ -268,7 +268,7 @@ BsonAppendOid(BSON *b, const char* key, bson_oid_t *v)
 bool
 BsonAppendBool(BSON *b, const char* key, bool v)
 {
-	return (bson_append_int(b, key, v) == MONGO_OK);
+	return (bson_append_bool(b, key, v) == MONGO_OK);
 }
 
 bool
