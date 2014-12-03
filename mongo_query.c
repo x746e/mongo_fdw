@@ -1,18 +1,30 @@
 /*-------------------------------------------------------------------------
  *
  * mongo_query.c
+ * 		Foreign-data wrapper for remote MongoDB servers
  *
- * Function definitions for sending queries to MongoDB. These functions assume
- * that queries are sent through the official MongoDB C driver, and apply query
- * optimizations to reduce the amount of data fetched from the driver.
+ * Portions Copyright (c) 2012-2014, PostgreSQL Global Development Group
  *
- * Copyright (c) 2012-2014 Citus Data, Inc.
+ * Portions Copyright (c) 2004-2014, EnterpriseDB Corporation.
+ *
+ * Portions Copyright (c) 2012–2014 Citus Data, Inc.
+ *
+ * IDENTIFICATION
+ * 		mongo_query.c
  *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
+#include "mongo_wrapper.h"
+
+#ifdef META_DRIVER
+	#include "mongoc.h"
+#else
+	#include "mongo.h"
+#endif
 #include "mongo_fdw.h"
+#include "mongo_query.h"
 
 #include "catalog/pg_type.h"
 #include "nodes/makefuncs.h"
@@ -24,7 +36,9 @@
 #include "utils/lsyscache.h"
 #include "utils/numeric.h"
 #include "utils/timestamp.h"
-
+#include "bson.h"
+#include "json.h"
+#include "bits.h"
 
 /* Local functions forward declarations */
 static Expr * FindArgumentOfType(List *argumentList, NodeTag argumentType);
@@ -32,9 +46,73 @@ static char * MongoOperatorName(const char *operatorName);
 static List * EqualityOperatorList(List *operatorList);
 static List * UniqueColumnList(List *operatorList);
 static List * ColumnOperatorList(Var *column, List *operatorList);
-static void AppendConstantValue(bson *queryDocument, const char *keyName,
+static void AppendConstantValue(BSON *queryDocument, const char *keyName,
 								Const *constant);
 
+
+bool json_to_bson_append_element( bson *bb , const char *k , struct json_object *v );
+
+bool json_to_bson_append_element( bson *bb , const char *k , struct json_object *v ) {
+	bool status;
+	status = true;
+    if ( ! v ) {
+        bson_append_null( bb , k );
+        return status;
+    }
+
+    switch ( json_object_get_type( v ) ) {
+    case json_type_int:
+        bson_append_int( bb , k , json_object_get_int( v ) );
+        break;
+    case json_type_boolean:
+        bson_append_bool( bb , k , json_object_get_boolean( v ) );
+        break;
+    case json_type_double:
+        bson_append_double( bb , k , json_object_get_double( v ) );
+        break;
+    case json_type_string:
+        bson_append_string( bb , k , json_object_get_string( v ) );
+        break;
+    case json_type_object:
+    {
+		struct json_object *joj = NULL;
+		joj = json_object_object_get( v, "$oid" );
+		if (joj != NULL) {
+			bson_oid_t bsonObjectId;
+			memset(bsonObjectId.bytes, 0, sizeof(bsonObjectId.bytes));
+			BsonOidFromString(&bsonObjectId, json_object_get_string(joj) );
+			status = BsonAppendOid( bb, k , &bsonObjectId);
+			break;
+		}
+		joj = json_object_object_get( v, "$date" );
+		if (joj != NULL) {
+			status = BsonAppendDate( bb, k , json_object_get_int64(joj));
+			break;
+		}
+
+        bson_append_start_object( bb , k );
+		json_object_object_foreach( v, kk, vv ) {
+			json_to_bson_append_element( bb , kk , vv );
+		}
+        bson_append_finish_object( bb );
+        break;
+    }
+    case json_type_array:
+        bson_append_start_array( bb , k );
+		int i;
+		char buf[10];
+		for ( i=0; i<json_object_array_length( v ); i++ ) {
+			sprintf( buf , "%d" , i );
+			json_to_bson_append_element( bb , buf , json_object_array_get_idx( v , i ) );
+		}
+        bson_append_finish_object( bb );
+        break;
+    default:
+    	status = false;
+        fprintf( stderr , "can't handle type for : %s\n" , json_object_to_json_string( v ) );
+    }
+    return status;
+}
 
 /*
  * ApplicableOpExpressionList walks over all filter clauses that relate to this
@@ -153,7 +231,7 @@ FindArgumentOfType(List *argumentList, NodeTag argumentType)
  * "l_shipdate >= date '1994-01-01' AND l_shipdate < date '1995-01-01'" become
  * "l_shipdate: { $gte: new Date(757382400000), $lt: new Date(788918400000) }".
  */
-bson *
+BSON *
 QueryDocument(Oid relationId, List *opExpressionList)
 {
 	List *equalityOperatorList = NIL;
@@ -161,12 +239,9 @@ QueryDocument(Oid relationId, List *opExpressionList)
 	List *columnList = NIL;
 	ListCell *equalityOperatorCell = NULL;
 	ListCell *columnCell = NULL;
-	bson *queryDocument = NULL;
-	int documentStatus = BSON_OK;
+	BSON *queryDocument = NULL;
 
-	queryDocument = bson_alloc();
-	bson_init(queryDocument);
-
+	queryDocument = BsonCreate();
 	/*
 	 * We distinguish between equality expressions and others since we need to
 	 * insert the latter (<, >, <=, >=, <>) as separate sub-documents into the
@@ -209,6 +284,7 @@ QueryDocument(Oid relationId, List *opExpressionList)
 		char *columnName = NULL;
 		List *columnOperatorList = NIL;
 		ListCell *columnOperatorCell = NULL;
+		BSON r;
 
 		columnId = column->varattno;
 		columnName = get_relid_attribute_name(relationId, columnId);
@@ -217,7 +293,7 @@ QueryDocument(Oid relationId, List *opExpressionList)
 		columnOperatorList = ColumnOperatorList(column, comparisonOperatorList);
 
 		/* for comparison expressions, start a sub-document */
-		bson_append_start_object(queryDocument, columnName);
+		BsonAppendStartObject(queryDocument, columnName, &r);
 
 		foreach(columnOperatorCell, columnOperatorList)
 		{
@@ -230,15 +306,16 @@ QueryDocument(Oid relationId, List *opExpressionList)
 
 			operatorName = get_opname(columnOperator->opno);
 			mongoOperatorName = MongoOperatorName(operatorName);
-
+#ifdef META_DRIVER
+			AppendConstantValue(&r, mongoOperatorName, constant);
+#else
 			AppendConstantValue(queryDocument, mongoOperatorName, constant);
+#endif
 		}
-
-		bson_append_finish_object(queryDocument);
+		BsonAppendFinishObject(queryDocument, &r);
 	}
 
-	documentStatus = bson_finish(queryDocument);
-	if (documentStatus != BSON_OK)
+	if (!BsonFinish(queryDocument))
 	{
 		ereport(ERROR, (errmsg("could not create document for query"),
 						errhint("BSON error: %d", queryDocument->err)));
@@ -361,61 +438,69 @@ ColumnOperatorList(Var *column, List *operatorList)
  * its MongoDB equivalent.
  */
 static void
-AppendConstantValue(bson *queryDocument, const char *keyName, Const *constant)
+AppendConstantValue(BSON *queryDocument, const char *keyName, Const *constant)
 {
-	Datum constantValue = constant->constvalue;
-	Oid constantTypeId = constant->consttype;
-
-	bool constantNull = constant->constisnull;
-	if (constantNull)
+	if (constant->constisnull)
 	{
-		bson_append_null(queryDocument, keyName);
+		BsonAppendNull(queryDocument, keyName);
 		return;
 	}
+	AppenMongoValue(queryDocument, keyName, constant->constvalue, false, constant->consttype);
+}
 
-	switch(constantTypeId)
+bool
+AppenMongoValue(BSON *queryDocument, const char *keyName, Datum value, bool isnull, Oid id)
+{
+	bool status;
+	if (isnull)
+	{
+		status = BsonAppendNull(queryDocument, keyName);
+		return status;
+	}
+
+	switch(id)
 	{
 		case INT2OID:
 		{
-			int16 value = DatumGetInt16(constantValue);
-			bson_append_int(queryDocument, keyName, (int) value);
+			int16 valueInt = DatumGetInt16(value);
+			status = BsonAppendInt32(queryDocument, keyName, (int) valueInt);
 			break;
 		}
 		case INT4OID:
 		{
-			int32 value = DatumGetInt32(constantValue);
-			bson_append_int(queryDocument, keyName, value);
+			int32 valueInt = DatumGetInt32(value);
+			status = BsonAppendInt32(queryDocument, keyName, valueInt);
 			break;
 		}
 		case INT8OID:
 		{
-			int64 value = DatumGetInt64(constantValue);
-			bson_append_long(queryDocument, keyName, value);
+			int64 valueLong = DatumGetInt64(value);
+			status = BsonAppendInt64(queryDocument, keyName, valueLong);
 			break;
 		}
 		case FLOAT4OID:
 		{
-			float4 value = DatumGetFloat4(constantValue);
-			bson_append_double(queryDocument, keyName, (double) value);
+			float4 valueFloat = DatumGetFloat4(value);
+			status = BsonAppendDouble(queryDocument, keyName, (double) valueFloat);
 			break;
 		}
 		case FLOAT8OID:
 		{
-			float8 value = DatumGetFloat8(constantValue);
-			bson_append_double(queryDocument, keyName, value);
+			float8 valueFloat = DatumGetFloat8(value);
+			status = BsonAppendDouble(queryDocument, keyName, valueFloat);
 			break;
 		}
 		case NUMERICOID:
 		{
-			Datum valueDatum = DirectFunctionCall1(numeric_float8, constantValue);
-			float8 value = DatumGetFloat8(valueDatum);
-			bson_append_double(queryDocument, keyName, value);
+			Datum valueDatum = DirectFunctionCall1(numeric_float8, value);
+			float8 valueFloat = DatumGetFloat8(valueDatum);
+			status = BsonAppendDouble(queryDocument, keyName, valueFloat);
 			break;
 		}
 		case BOOLOID:
 		{
-			bool value = DatumGetBool(constantValue);
-			bson_append_int(queryDocument, keyName, (int) value);
+			bool valueBool = DatumGetBool(value);
+			status = BsonAppendBool(queryDocument, keyName, valueBool);
 			break;
 		}
 		case BPCHAROID:
@@ -425,46 +510,196 @@ AppendConstantValue(bson *queryDocument, const char *keyName, Const *constant)
 			char *outputString = NULL;
 			Oid outputFunctionId = InvalidOid;
 			bool typeVarLength = false;
-
-			getTypeOutputInfo(constantTypeId, &outputFunctionId, &typeVarLength);
-			outputString = OidOutputFunctionCall(outputFunctionId, constantValue);
-
-			bson_append_string(queryDocument, keyName, outputString);
+			getTypeOutputInfo(id, &outputFunctionId, &typeVarLength);
+			outputString = OidOutputFunctionCall(outputFunctionId, value);
+			status = BsonAppendUTF8(queryDocument, keyName, outputString);
 			break;
 		}
-	    case NAMEOID:
+		case BYTEAOID:
+		{
+			int len;
+			char *data;
+			char *result = DatumGetPointer(value);
+			if (VARATT_IS_1B(result)) {
+				len = VARSIZE_1B(result) - VARHDRSZ_SHORT;
+				data = VARDATA_1B(result);
+			} else {
+				len = VARSIZE_4B(result) - VARHDRSZ;
+				data = VARDATA_4B(result);
+			}
+			status = BsonAppendBinary(queryDocument, keyName, data, len);
+			break;
+		}
+		case NAMEOID:
 		{
 			char *outputString = NULL;
 			Oid outputFunctionId = InvalidOid;
 			bool typeVarLength = false;
 			bson_oid_t bsonObjectId;
 			memset(bsonObjectId.bytes, 0, sizeof(bsonObjectId.bytes));
-
-			getTypeOutputInfo(constantTypeId, &outputFunctionId, &typeVarLength);
-			outputString = OidOutputFunctionCall(outputFunctionId, constantValue);
-			bson_oid_from_string(&bsonObjectId, outputString);
-
-			bson_append_oid(queryDocument, keyName, &bsonObjectId);
+			getTypeOutputInfo(id, &outputFunctionId, &typeVarLength);
+			outputString = OidOutputFunctionCall(outputFunctionId, value);
+			BsonOidFromString(&bsonObjectId, outputString);
+			status = BsonAppendOid(queryDocument, keyName, &bsonObjectId);
 			break;
 		}
 		case DATEOID:
 		{
-			Datum valueDatum = DirectFunctionCall1(date_timestamp, constantValue);
+			Datum valueDatum = DirectFunctionCall1(date_timestamp, value);
 			Timestamp valueTimestamp = DatumGetTimestamp(valueDatum);
 			int64 valueMicroSecs = valueTimestamp + POSTGRES_TO_UNIX_EPOCH_USECS;
 			int64 valueMilliSecs = valueMicroSecs / 1000;
 
-			bson_append_date(queryDocument, keyName, valueMilliSecs);
+			status = BsonAppendDate(queryDocument, keyName, valueMilliSecs);
 			break;
 		}
 		case TIMESTAMPOID:
 		case TIMESTAMPTZOID:
 		{
-			Timestamp valueTimestamp = DatumGetTimestamp(constantValue);
+			Timestamp valueTimestamp = DatumGetTimestamp(value);
 			int64 valueMicroSecs = valueTimestamp + POSTGRES_TO_UNIX_EPOCH_USECS;
 			int64 valueMilliSecs = valueMicroSecs / 1000;
 
-			bson_append_date(queryDocument, keyName, valueMilliSecs);
+			status = BsonAppendDate(queryDocument, keyName, valueMilliSecs);
+			break;
+		}
+		case NUMERICARRAY_OID:
+		{
+			ArrayType *array;
+			Oid elmtype;
+			int16 elmlen;
+			bool elmbyval;
+			char elmalign;
+			int num_elems;
+			Datum *elem_values;
+			bool *elem_nulls;
+			int i;
+			BSON t;
+
+			array = DatumGetArrayTypeP(value);
+			elmtype = ARR_ELEMTYPE(array);
+			get_typlenbyvalalign(elmtype, &elmlen, &elmbyval, &elmalign);
+
+			deconstruct_array(array, elmtype, elmlen, elmbyval, elmalign, &elem_values, &elem_nulls, &num_elems);
+
+			BsonAppendStartArray(queryDocument, keyName, &t);
+			for (i = 0; i < num_elems; i++)
+			{
+				Datum valueDatum;
+				float8 valueFloat;
+				if (elem_nulls[i])
+					continue;
+
+				valueDatum = DirectFunctionCall1(numeric_float8, elem_values[i]);
+				valueFloat = DatumGetFloat8(valueDatum);
+				char *index = malloc(snprintf(0, 0, "%d", i)+1);
+                sprintf(index, "%d", i);
+#ifdef META_DRIVER
+				status = BsonAppendDouble(&t, index, valueFloat);
+#else
+				status = BsonAppendDouble(queryDocument, index, valueFloat);
+#endif
+			}
+			BsonAppendFinishArray(queryDocument, &t);
+			pfree(elem_values);
+			pfree(elem_nulls);
+			break;
+		}
+		case TEXTARRAYOID:
+		{
+			ArrayType *array;
+			Oid elmtype;
+			int16 elmlen;
+			bool elmbyval;
+			char elmalign;
+			int num_elems;
+			Datum *elem_values;
+			bool *elem_nulls;
+			int i;
+			BSON t;
+
+			array = DatumGetArrayTypeP(value);
+			elmtype = ARR_ELEMTYPE(array);
+			get_typlenbyvalalign(elmtype, &elmlen, &elmbyval, &elmalign);
+
+			deconstruct_array(array, elmtype, elmlen, elmbyval, elmalign, &elem_values, &elem_nulls, &num_elems);
+
+			BsonAppendStartArray(queryDocument, keyName, &t);
+			for (i = 0; i < num_elems; i++)
+			{
+				char *valueString = NULL;
+				Oid outputFunctionId = InvalidOid;
+				bool typeVarLength = false;
+				if (elem_nulls[i])
+					continue;
+				getTypeOutputInfo(TEXTOID, &outputFunctionId, &typeVarLength);
+				valueString = OidOutputFunctionCall(outputFunctionId, elem_values[i]);
+				char *index = malloc(snprintf(0, 0, "%d", i)+1);
+                sprintf(index, "%d", i);
+				status = BsonAppendUTF8(queryDocument, index, valueString);
+			}
+			BsonAppendFinishArray(queryDocument, &t);
+			pfree(elem_values);
+			pfree(elem_nulls);
+			break;
+		}
+		case 1003: // NAMEARRAYOID
+		{
+			ArrayType *array;
+			Oid elmtype;
+			int16 elmlen;
+			bool elmbyval;
+			char elmalign;
+			int num_elems;
+			Datum *elem_values;
+			bool *elem_nulls;
+			int i;
+			BSON t;
+
+			array = DatumGetArrayTypeP(value);
+			elmtype = ARR_ELEMTYPE(array);
+			get_typlenbyvalalign(elmtype, &elmlen, &elmbyval, &elmalign);
+
+			deconstruct_array(array, elmtype, elmlen, elmbyval, elmalign, &elem_values, &elem_nulls, &num_elems);
+
+			BsonAppendStartArray(queryDocument, keyName, &t);
+			for (i = 0; i < num_elems; i++)
+			{
+				if (elem_nulls[i])
+					continue;
+				char *valueString = NULL;
+				Oid outputFunctionId = InvalidOid;
+				bool typeVarLength = false;
+				bson_oid_t bsonObjectId;
+				memset(bsonObjectId.bytes, 0, sizeof(bsonObjectId.bytes));
+				getTypeOutputInfo(NAMEOID, &outputFunctionId, &typeVarLength);
+				valueString = OidOutputFunctionCall(outputFunctionId, elem_values[i]);
+				BsonOidFromString(&bsonObjectId, valueString);
+				char *index = malloc(snprintf(0, 0, "%d", i)+1);
+                sprintf(index, "%d", i);
+				status = BsonAppendOid(queryDocument, index, &bsonObjectId);
+			}
+			BsonAppendFinishArray(queryDocument, &t);
+			pfree(elem_values);
+			pfree(elem_nulls);
+			break;
+		}
+		case JSONOID:
+		{
+			char *outputString = NULL;
+			Oid outputFunctionId = InvalidOid;
+			bool typeVarLength = false;
+			getTypeOutputInfo(id, &outputFunctionId, &typeVarLength);
+			outputString = OidOutputFunctionCall(outputFunctionId, value);
+    		struct json_object *o = json_tokener_parse( outputString );
+
+			if ( is_error( o ) ) {
+				fprintf( stderr , "\t ERROR PARSING\n" );
+				status = 0;
+				break;
+			}
+
+			status = json_to_bson_append_element( queryDocument, keyName, o );
 			break;
 		}
 		default:
@@ -474,12 +709,13 @@ AppendConstantValue(bson *queryDocument, const char *keyName, Const *constant)
 			 * byte arrays are easy to add, but they need testing. Other types
 			 * such as money or inet, do not have equivalents in MongoDB.
 			 */
-			ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
-							errmsg("cannot convert constant value to BSON value"),
-							errhint("Constant value data type: %u", constantTypeId)));
+			 ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
+					errmsg("cannot convert constant value to BSON value"),
+						errhint("Constant value data type: %u", id)));
 			break;
 		}
 	}
+	return status;
 }
 
 

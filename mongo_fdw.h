@@ -1,10 +1,16 @@
 /*-------------------------------------------------------------------------
  *
  * mongo_fdw.h
+ * 		Foreign-data wrapper for remote MongoDB servers
  *
- * Type and function declarations for MongoDB foreign data wrapper.
+ * Portions Copyright (c) 2012-2014, PostgreSQL Global Development Group
  *
- * Copyright (c) 2012-2014 Citus Data, Inc.
+ * Portions Copyright (c) 2004-2014, EnterpriseDB Corporation.
+ *
+ * Portions Copyright (c) 2012–2014 Citus Data, Inc.
+ *
+ * IDENTIFICATION
+ * 		mongo_fdw.h
  *
  *-------------------------------------------------------------------------
  */
@@ -12,8 +18,15 @@
 #ifndef MONGO_FDW_H
 #define MONGO_FDW_H
 
+#include "config.h"
+#include "mongo_wrapper.h"
 #include "bson.h"
-#include "mongo.h"
+
+#ifdef META_DRIVER
+	#include "mongoc.h"
+#else
+	#include "mongo.h"
+#endif
 
 #include "fmgr.h"
 #include "catalog/pg_foreign_server.h"
@@ -22,13 +35,60 @@
 #include "nodes/pg_list.h"
 #include "nodes/relation.h"
 #include "utils/timestamp.h"
+#include "access/reloptions.h"
+#include "catalog/pg_type.h"
+#include "commands/defrem.h"
+#include "commands/explain.h"
+#include "commands/vacuum.h"
+#include "foreign/fdwapi.h"
+#include "foreign/foreign.h"
+#include "nodes/makefuncs.h"
+#include "optimizer/cost.h"
+#include "optimizer/pathnode.h"
+#include "optimizer/plancat.h"
+#include "optimizer/planmain.h"
+#include "optimizer/restrictinfo.h"
+#include "utils/array.h"
+#include "utils/builtins.h"
+#include "utils/date.h"
+#include "utils/hsearch.h"
+#include "utils/lsyscache.h"
+#include "utils/rel.h"
+#include "utils/memutils.h"
+#include "catalog/pg_user_mapping.h"
 
+#ifdef META_DRIVER
+	#define BSON bson_t
+	#define BSON_TYPE bson_type_t
+	#define BSON_ITERATOR bson_iter_t
+	#define MONGO_CONN mongoc_client_t
+	#define MONGO_CURSOR mongoc_cursor_t
+#else
+	#define BSON bson
+	#define BSON_TYPE bson_type
+	#define BSON_ITERATOR bson_iterator
+	#define MONGO_CONN mongo
+	#define MONGO_CURSOR mongo_cursor
+	#define BSON_TYPE_DOCUMENT BSON_OBJECT
+	#define BSON_TYPE_NULL BSON_NULL
+	#define BSON_TYPE_ARRAY BSON_ARRAY
+	#define BSON_TYPE_INT32 BSON_INT
+	#define BSON_TYPE_INT64 BSON_LONG
+	#define BSON_TYPE_DOUBLE BSON_DOUBLE
+	#define BSON_TYPE_BINDATA BSON_BINDATA
+	#define BSON_TYPE_BOOL BSON_BOOL
+	#define BSON_TYPE_UTF8 BSON_STRING
+	#define BSON_TYPE_OID BSON_OID
+	#define BSON_TYPE_DATE_TIME BSON_DATE
+#endif
 
 /* Defines for valid option names */
 #define OPTION_NAME_ADDRESS "address"
 #define OPTION_NAME_PORT "port"
 #define OPTION_NAME_DATABASE "database"
 #define OPTION_NAME_COLLECTION "collection"
+#define OPTION_NAME_USERNAME "username"
+#define OPTION_NAME_PASSWORD "password"
 
 /* Default values for option parameters */
 #define DEFAULT_IP_ADDRESS "127.0.0.1"
@@ -58,16 +118,21 @@ typedef struct MongoValidOption
 
 
 /* Array of options that are valid for mongo_fdw */
-static const uint32 ValidOptionCount = 4;
+static const uint32 ValidOptionCount = 6;
 static const MongoValidOption ValidOptionArray[] =
 {
 	/* foreign server options */
 	{ OPTION_NAME_ADDRESS, ForeignServerRelationId },
-	{ OPTION_NAME_PORT,  ForeignServerRelationId },
+	{ OPTION_NAME_PORT, ForeignServerRelationId },
 
 	/* foreign table options */
 	{ OPTION_NAME_DATABASE, ForeignTableRelationId },
-	{ OPTION_NAME_COLLECTION, ForeignTableRelationId }
+	{ OPTION_NAME_COLLECTION, ForeignTableRelationId },
+
+	/* User mapping options */
+	{ OPTION_NAME_USERNAME, UserMappingRelationId },
+	{ OPTION_NAME_PASSWORD, UserMappingRelationId }
+
 };
 
 
@@ -78,11 +143,12 @@ static const MongoValidOption ValidOptionArray[] =
  */
 typedef struct MongoFdwOptions
 {
-	char *addressName;
-	int32 portNumber;
-	char *databaseName;
+	char *svr_address;
+	int32 svr_port;
+	char *svr_database;
 	char *collectionName;
-
+	char *svr_username;
+	char *svr_password;
 } MongoFdwOptions;
 
 
@@ -90,14 +156,29 @@ typedef struct MongoFdwOptions
  * MongoFdwExecState keeps foreign data wrapper specific execution state that we
  * create and hold onto when executing the query.
  */
-typedef struct MongoFdwExecState
+/*
+ * Execution state of a foreign insert/update/delete operation.
+ */
+typedef struct MongoFdwModifyState
 {
-	struct HTAB *columnMappingHash;
-	mongo *mongoConnection;
-	mongo_cursor *mongoCursor;
-	bson *queryDocument;
+	Relation		rel;             /* relcache entry for the foreign table */
+	List			*target_attrs;   /* list of target attribute numbers */
 
-} MongoFdwExecState;
+	/* info about parameters for prepared statement */
+	int			p_nums;			/* number of parameters to transmit */
+	FmgrInfo		*p_flinfo;		/* output conversion functions for them */
+
+	struct HTAB 		*columnMappingHash;
+
+	MONGO_CONN		*mongoConnection;	/* MongoDB connection */
+	MONGO_CURSOR		*mongoCursor;		/* MongoDB cursor */
+	BSON			*queryDocument;		/* Bson Document */
+
+	MongoFdwOptions 	*options;
+
+	/* working memory context */
+	MemoryContext temp_cxt;				/* context for per-tuple temporary data */
+} MongoFdwModifyState;
 
 
 /*
@@ -113,13 +194,21 @@ typedef struct ColumnMapping
 	Oid columnTypeId;
 	int32 columnTypeMod;
 	Oid columnArrayTypeId;
-
 } ColumnMapping;
 
+/* options.c */
+extern MongoFdwOptions * mongo_get_options(Oid foreignTableId);
+extern void mongo_free_options(MongoFdwOptions *options);
+extern StringInfo mongo_option_names_string(Oid currentContextId);
+
+/* connection.c */
+MONGO_CONN* mongo_get_connection(ForeignServer *server, UserMapping *user, MongoFdwOptions *opt);
+extern void mongo_cleanup_connection(void);
+extern void mongo_release_connection(MONGO_CONN* conn);
 
 /* Function declarations related to creating the mongo query */
 extern List * ApplicableOpExpressionList(RelOptInfo *baserel);
-extern bson * QueryDocument(Oid relationId, List *opExpressionList);
+extern BSON * QueryDocument(Oid relationId, List *opExpressionList);
 extern List * ColumnList(RelOptInfo *baserel);
 
 /* Function declarations for foreign data wrapper */
